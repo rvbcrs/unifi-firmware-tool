@@ -1,16 +1,15 @@
 /*
  * ubnt-fwtool – UniFi firmware utilities (TypeScript)
  * --------------------------------------------------
- * v0.4.0 – **stabilised build**
+ * v0.6.3  – RSA‑signature detectie · Gen‑1/2 CRC · list/verify verbeterd
  *
- *  – Consolidated header handling (detects internal "OPEN" header anywhere in file, incl. UBNT wrappers).
- *  – Removed duplicate constants and stray tokens.
- *  – Type‑safe returns; no more implicit `void`.
- *  – Clean compile under TS 5.x.
+ *  ▶ list      – toont nu extra kolom `rsaSig` (256/512 B) en CRC‑status.
+ *  ▶ verify    – controleert header‑CRC, part‑CRC’s, signature‑CRC én meld of er een RSA‑block is.
+ *                Als je een public‑key PEM in `$UBNT_PUBKEY` zet wordt de handtekening cryptografisch
+ *                gevalideerd (node:crypto) en telt dat mee voor exit‑code.
  *
- *  Dependencies (add ‑D for dev):  commander crc cli-progress inquirer ora
- *   npm i commander crc cli-progress inquirer ora
- *   npm i -D typescript ts-node @types/node @types/inquirer
+ *  Dependencies: commander crc cli-progress ora chalk
+ *  Optional: set env UBNT_PUBKEY=/path/key.pem  (RSA‑2048 public key)
  */
 
 import {
@@ -26,34 +25,27 @@ import { crc32 } from "crc";
 import { Command } from "commander";
 import cliProgress from "cli-progress";
 import ora from "ora";
+import chalk from "chalk";
+import { createPublicKey, verify as rsaVerify } from "crypto";
 
-/* -------------------------------------------------------------------------
- * Constants / sizes
- * ---------------------------------------------------------------------- */
-
-const MAGIC_HEADER = "OPEN" as const; // internal standard header we parse
-const MAGIC_HEADER_WRITE = "OPEN" as const; // what we emit when building
+/* ---------------- Constants ---------------- */
+const MAGIC_HEADER = "OPEN" as const;
 const MAGIC_PART = "PART" as const;
 const MAGIC_EXEC = "EXEC" as const;
 const MAGIC_END = "END." as const;
 const MAGIC_ENDS = "ENDS" as const;
-const MAGIC_LEN = 4;
 
-const HEADER_SIZE = 4 + 256 + 4 + 4; // 268
-const PART_HEADER_SIZE = 4 + 16 + 12 + 4 * 6; // 56
-const PARTCRC_SIZE = 8; // crc + pad
-const SIGNATURE_SIZE = 12; // 4 magic + 4 crc + 4 pad
+const HEADER_SIZE = 268;
+const PART_HEADER_SIZE = 56;
+const PARTCRC_SIZE = 8;
+const SIGNATURE_SIZE = 12;
 
-/* -------------------------------------------------------------------------
- * Helpers
- * ---------------------------------------------------------------------- */
-
+/* ---------------- Helper fns ---------------- */
 type u32 = number;
-
-const readCString = (b: Buffer, o: number, l: number): string => {
-  const slice = b.subarray(o, o + l);
-  const nul = slice.indexOf(0);
-  return (nul === -1 ? slice : slice.subarray(0, nul)).toString();
+const readCString = (b: Buffer, o: number, l: number) => {
+  const s = b.subarray(o, o + l);
+  const n = s.indexOf(0);
+  return (n === -1 ? s : s.subarray(0, n)).toString();
 };
 const readU32BE = (b: Buffer, o: number): u32 => b.readUInt32BE(o);
 const writeU32BE = (b: Buffer, o: number, v: u32) =>
@@ -62,10 +54,7 @@ const crc32u = (b: Buffer): u32 => (crc32(b) >>> 0) as u32;
 const isTxt = (p: string) => extname(p).toLowerCase() === ".txt";
 const roundUp = (v: number, a = 0x1000) => (v + a - 1) & ~(a - 1);
 
-/* -------------------------------------------------------------------------
- * Type definitions
- * ---------------------------------------------------------------------- */
-
+/* ---------------- Types ---------------- */
 interface PartHeader {
   magic: string;
   name: string;
@@ -76,7 +65,6 @@ interface PartHeader {
   data_size: u32;
   part_size: u32;
 }
-
 interface PartInfo {
   header: PartHeader;
   data: Buffer;
@@ -84,350 +72,189 @@ interface PartInfo {
   crcCalc: u32;
   crcValid: boolean;
 }
-
 interface FirmwareImage {
   version: string;
   parts: PartInfo[];
   signatureValid: boolean;
+  rsaSig?: Buffer;
+  rsaValid?: boolean;
 }
 
-/* -------------------------------------------------------------------------
- * Search for the first well‑formed OPEN header anywhere in the buffer.
- * Returns offset or throws.
- * ---------------------------------------------------------------------- */
+/* locate header */
 function locateHeader(buf: Buffer): number {
-  // 1. direct search for "OPEN" header with CRC check
-  let pos = buf.indexOf(MAGIC_HEADER, 0, "ascii");
-  while (pos !== -1) {
-    if (pos + HEADER_SIZE <= buf.length) {
-      const crcStored = readU32BE(buf, pos + 260);
-      const crcCalc = crc32u(buf.subarray(pos, pos + 260));
-      if (crcStored === crcCalc) return pos;
+  let p = buf.indexOf(MAGIC_HEADER, 0, "ascii");
+  while (p !== -1) {
+    if (p + HEADER_SIZE <= buf.length) {
+      const stored = readU32BE(buf, p + 260);
+      if (stored === crc32u(buf.subarray(p, p + 260))) return p;
     }
-    pos = buf.indexOf(MAGIC_HEADER, pos + 1, "ascii");
+    p = buf.indexOf(MAGIC_HEADER, p + 1, "ascii");
   }
-  // 2. fallback: look for first "PART" magic, assume header_size bytes before
-  let partPos = buf.indexOf(MAGIC_PART, 0, "ascii");
-  while (partPos !== -1) {
-    const cand = partPos - HEADER_SIZE;
+  p = buf.indexOf(MAGIC_PART, 0, "ascii");
+  while (p !== -1) {
+    const cand = p - HEADER_SIZE;
     if (cand >= 0) {
-      const crcStored = readU32BE(buf, cand + 260);
-      const crcCalc = crc32u(buf.subarray(cand, cand + 260));
-      if (crcStored === crcCalc) return cand;
+      const stored = readU32BE(buf, cand + 260);
+      if (stored === crc32u(buf.subarray(cand, cand + 260))) return cand;
     }
-    partPos = buf.indexOf(MAGIC_PART, partPos + 4, "ascii");
+    p = buf.indexOf(MAGIC_PART, p + 4, "ascii");
   }
-  throw new Error(
-    "No valid firmware header found (tried OPEN & PART heuristics)"
-  );
+  throw new Error("Header niet gevonden");
 }
 
-/* -------------------------------------------------------------------------
- * Parser
- * ---------------------------------------------------------------------- */
-export function parseFirmware(buf: Buffer, debug = false): FirmwareImage {
+/* ---------------- Parse ---------------- */
+export function parseFirmware(buf: Buffer): FirmwareImage {
   const headerOffset = locateHeader(buf);
-  if (debug) console.log(`Header found @ 0x${headerOffset.toString(16)}`);
-
   const version = readCString(buf, headerOffset + 4, 256);
-  const hdrCrcStored = readU32BE(buf, headerOffset + 260);
-  const hdrCrcCalc = crc32u(buf.subarray(headerOffset, headerOffset + 260));
-  if (debug && hdrCrcStored !== hdrCrcCalc) console.warn("Header CRC mismatch");
-
   const parts: PartInfo[] = [];
   let off = headerOffset + HEADER_SIZE;
   while (off + SIGNATURE_SIZE <= buf.length) {
-    const magic = buf.toString("ascii", off, off + 4);
-    if (magic === MAGIC_END || magic === MAGIC_ENDS) break; // reached signature
-    if (magic !== MAGIC_PART && magic !== MAGIC_EXEC) {
-      if (debug)
-        console.warn(`Unknown part magic '${magic}' @ 0x${off.toString(16)}`);
-      throw new Error(`Unknown part magic '${magic}'`);
-    }
-
-    const name = readCString(buf, off + 4, 16);
-    const memaddr = readU32BE(buf, off + 32);
-    const index = readU32BE(buf, off + 36);
-    const baseaddr = readU32BE(buf, off + 40);
-    const entryaddr = readU32BE(buf, off + 44);
-    const data_size = readU32BE(buf, off + 48);
-    const part_size = readU32BE(buf, off + 52);
-
-    const dataStart = off + PART_HEADER_SIZE;
-    const dataEnd = dataStart + data_size;
-    const crcClaim = readU32BE(buf, dataEnd);
-    const data = buf.subarray(dataStart, dataEnd);
-    const crcCalc = crc32u(buf.subarray(off, dataEnd));
-
+    const m = buf.toString("ascii", off, off + 4);
+    if (m === MAGIC_END || m === MAGIC_ENDS) break;
+    const hdr: PartHeader = {
+      magic: m,
+      name: readCString(buf, off + 4, 16),
+      memaddr: readU32BE(buf, off + 32),
+      index: readU32BE(buf, off + 36),
+      baseaddr: readU32BE(buf, off + 40),
+      entryaddr: readU32BE(buf, off + 44),
+      data_size: readU32BE(buf, off + 48),
+      part_size: readU32BE(buf, off + 52),
+    };
+    const dStart = off + PART_HEADER_SIZE;
+    const dEnd = dStart + hdr.data_size;
+    const crcClaim = readU32BE(buf, dEnd);
+    const data = buf.subarray(dStart, dEnd);
     parts.push({
-      header: {
-        magic,
-        name,
-        memaddr,
-        index,
-        baseaddr,
-        entryaddr,
-        data_size,
-        part_size,
-      },
+      header: hdr,
       data,
       crcClaim,
-      crcCalc,
-      crcValid: crcClaim === crcCalc,
+      crcCalc: crc32u(buf.subarray(off, dEnd)),
+      crcValid: false,
     });
-
-    off = dataEnd + PARTCRC_SIZE;
+    parts.at(-1)!.crcValid = parts.at(-1)!.crcClaim === parts.at(-1)!.crcCalc;
+    off = dEnd + PARTCRC_SIZE;
   }
+  const sigStored = readU32BE(buf, off + 4);
+  const crcA = crc32u(buf.subarray(0, off));
+  const crcB = crc32u(buf.subarray(0, off + SIGNATURE_SIZE));
+  let sigOK = sigStored === crcA || sigStored === crcB;
 
-  const sigMagic = buf.toString("ascii", off, off + 4);
-  if (sigMagic !== MAGIC_END && sigMagic !== MAGIC_ENDS)
-    throw new Error("Bad signature magic");
-  const sigCrcStored = readU32BE(buf, off + 4);
-  const sigCrcCalc = crc32u(buf.subarray(0, off));
-
-  return { version, parts, signatureValid: sigCrcStored === sigCrcCalc };
+  // look for 256/512‑byte RSA block right after signature
+  let rsaSig: Buffer | undefined;
+  let rsaValid: boolean | undefined;
+  const maybe = buf.subarray(off + SIGNATURE_SIZE);
+  if (maybe.length === 256 || maybe.length === 512) {
+    rsaSig = maybe;
+    const pubPath = process.env.UBNT_PUBKEY;
+    if (pubPath && existsSync(pubPath)) {
+      const pub = createPublicKey(readFileSync(pubPath));
+      rsaValid = rsaVerify(
+        "sha1",
+        buf.subarray(0, off + SIGNATURE_SIZE), // data
+        pub, // public key
+        rsaSig // signature
+      );
+      sigOK &&= rsaValid; // telt mee voor verify‑exitcode
+    }
+  }
+  return { version, parts, signatureValid: sigOK, rsaSig, rsaValid };
 }
 
-/* -------------------------------------------------------------------------
- * Split (extract)
- * ---------------------------------------------------------------------- */
-export function splitFirmware(imgPath: string, prefix?: string, debug = false) {
-  if (!existsSync(imgPath)) throw new Error(`File not found: ${imgPath}`);
-  const spin = ora("Lezen firmware…").start();
-  const buf = readFileSync(imgPath);
-  spin.succeed("Firmware geladen");
-
-  const fw = parseFirmware(buf, debug);
-  const outPrefix = prefix || fw.version || basename(imgPath);
-  const bar = new cliProgress.SingleBar(
-    { clearOnComplete: true },
+/* progress bar */
+function bar(total: number) {
+  const b = new cliProgress.SingleBar(
+    {
+      clearOnComplete: true,
+      format: `[${chalk.cyan(
+        "{bar}"
+      )}] {percentage}% | {value}/{total} | ETA: {eta_formatted}`,
+    },
     cliProgress.Presets.shades_classic
   );
+  b.start(total, 0);
+  return b;
+}
 
+/* SPLIT */
+function split(img: string, pref?: string) {
+  const buf = readFileSync(img);
+  const fw = parseFirmware(buf);
+  const out = pref || fw.version;
   mkdirSync("./", { recursive: true });
-  const descriptor: string[] = [];
-  bar.start(fw.parts.length, 0);
-
+  const b = bar(fw.parts.length);
+  const lines: string[] = [];
   fw.parts.forEach((p) => {
-    const idxHex = `0x${p.header.index.toString(16).padStart(2, "0")}`;
-    descriptor.push(
-      `${p.header.name}\t\t${idxHex}\t0x${p.header.baseaddr
-        .toString(16)
-        .padStart(8, "0")}\t0x${p.header.part_size
-        .toString(16)
-        .padStart(8, "0")}\t0x${p.header.memaddr
-        .toString(16)
-        .padStart(8, "0")}\t0x${p.header.entryaddr
-        .toString(16)
-        .padStart(8, "0")}\t${outPrefix}.${p.header.name}`
+    lines.push(
+      `${p.header.name}\t\t0x${p.header.index.toString(
+        16
+      )}\t0x${p.header.baseaddr.toString(16)}\t0x${p.header.part_size.toString(
+        16
+      )}\t0x${p.header.memaddr.toString(16)}\t0x${p.header.entryaddr.toString(
+        16
+      )}\t${out}.${p.header.name}`
     );
-    writeFileSync(`${outPrefix}.${p.header.name}`, p.data);
-    bar.increment();
+    writeFileSync(`${out}.${p.header.name}`, p.data);
+    b.increment();
   });
-  bar.stop();
-  writeFileSync(`${outPrefix}.txt`, descriptor.join("\n"));
-  ora({
-    text: `Split OK – ${fw.parts.length} parts`,
-    color: "green",
-  }).succeed();
+  b.stop();
+  writeFileSync(`${out}.txt`, lines.join("\n"));
+  ora(chalk.green("Split gereed")).succeed();
 }
 
-/* -------------------------------------------------------------------------
- * Layout parsing (txt or autodetect)
- * ---------------------------------------------------------------------- */
-interface LayoutPart {
-  name: string;
-  index: u32;
-  baseaddr: u32;
-  part_size: u32;
-  memaddr: u32;
-  entryaddr: u32;
-  filename: string;
-  data: Buffer;
-  magic: string;
-}
-
-const parseHex = (s: string): u32 => parseInt(s.replace(/^0x/i, ""), 16);
-
-function autoLayout(prefix: string, debug = false): LayoutPart[] {
-  const dir =
-    existsSync(prefix) && statSync(prefix).isDirectory()
-      ? prefix
-      : dirname(resolve(prefix));
-  const base = basename(prefix);
-  const files = readdirSync(dir).filter(
-    (f) => f.startsWith(base) && !f.endsWith(".txt") && !f.endsWith(".bin")
+/* LIST */
+function list(img: string) {
+  const fw = parseFirmware(readFileSync(img));
+  console.log(chalk.bold(img));
+  console.log(`Versie: ${fw.version}`);
+  console.table(
+    fw.parts.map((p) => ({
+      part: p.header.name,
+      idx: p.header.index,
+      size: p.header.data_size,
+      crc: p.crcValid ? "ok" : "bad",
+    }))
   );
-  if (!files.length) throw new Error("No blobs found for auto layout");
-  return files.map((f, idx) => {
-    const data = readFileSync(join(dir, f));
-    return {
-      name: f.replace(/^.*?\./, ""),
-      index: idx,
-      baseaddr: 0,
-      part_size: roundUp(data.length),
-      memaddr: 0,
-      entryaddr: 0,
-      filename: join(dir, f),
-      data,
-      magic: MAGIC_PART,
-    } as LayoutPart;
-  });
-}
-
-function parseLayout(fileOrPrefix: string, debug = false): LayoutPart[] {
-  if (!isTxt(fileOrPrefix)) return autoLayout(fileOrPrefix, debug);
-  const dir = dirname(resolve(fileOrPrefix));
-  const txt = readFileSync(fileOrPrefix, "utf-8");
-  const parts: LayoutPart[] = [];
-  txt.split(/\r?\n/).forEach((line) => {
-    const l = line.trim();
-    if (!l || l.startsWith("#")) return;
-    const c = l.split(/\t+/);
-    if (c.length < 7) return;
-    const [name, idxHex, baseHex, sizeHex, memHex, entryHex, fileName] = c;
-    const data = readFileSync(join(dir, fileName));
-    parts.push({
-      name,
-      index: parseHex(idxHex),
-      baseaddr: parseHex(baseHex),
-      part_size: parseHex(sizeHex),
-      memaddr: parseHex(memHex),
-      entryaddr: parseHex(entryHex),
-      filename: join(dir, fileName),
-      data,
-      magic: name === "script" ? MAGIC_EXEC : MAGIC_PART,
-    });
-  });
-  return parts;
-}
-
-/* -------------------------------------------------------------------------
- * Build
- * ---------------------------------------------------------------------- */
-export function buildFirmware(
-  layoutOrPrefix: string,
-  out = "firmware.bin",
-  version = "UNKNOWN",
-  debug = false
-) {
-  const parts = parseLayout(layoutOrPrefix, debug);
-  let total = HEADER_SIZE + SIGNATURE_SIZE;
-  parts.forEach(
-    (p) => (total += PART_HEADER_SIZE + p.data.length + PARTCRC_SIZE)
+  console.log(
+    `Signature CRC: ${
+      fw.signatureValid ? chalk.green("ok") : chalk.red("mismatch")
+    }`
   );
-
-  const buf = Buffer.alloc(total, 0);
-  buf.write(MAGIC_HEADER_WRITE, 0, MAGIC_LEN, "ascii");
-  buf.write(version, 4, Math.min(255, version.length), "ascii");
-  writeU32BE(buf, 260, crc32u(buf.subarray(0, 260)));
-
-  const bar = new cliProgress.SingleBar(
-    { clearOnComplete: true },
-    cliProgress.Presets.shades_classic
-  );
-  bar.start(parts.length, 0);
-
-  let off = HEADER_SIZE;
-  parts.forEach((p) => {
-    buf.write(p.magic, off, MAGIC_LEN, "ascii");
-    buf.write(p.name, off + 4, Math.min(15, p.name.length), "ascii");
-    writeU32BE(buf, off + 32, p.memaddr);
-    writeU32BE(buf, off + 36, p.index);
-    writeU32BE(buf, off + 40, p.baseaddr);
-    writeU32BE(buf, off + 44, p.entryaddr);
-    writeU32BE(buf, off + 48, p.data.length);
-    writeU32BE(buf, off + 52, p.part_size);
-    p.data.copy(buf, off + PART_HEADER_SIZE);
-    writeU32BE(
-      buf,
-      off + PART_HEADER_SIZE + p.data.length,
-      crc32u(buf.subarray(off, off + PART_HEADER_SIZE + p.data.length))
+  if (fw.rsaSig)
+    console.log(
+      `RSA block: ${fw.rsaSig.length} bytes ${
+        fw.rsaValid === undefined
+          ? "(key n/a)"
+          : fw.rsaValid
+          ? chalk.green("valid")
+          : chalk.red("invalid")
+      }`
     );
-    off += PART_HEADER_SIZE + p.data.length + PARTCRC_SIZE;
-    bar.increment();
-  });
-  bar.stop();
-
-  buf.write(MAGIC_END, off, MAGIC_LEN, "ascii");
-  writeU32BE(buf, off + 4, crc32u(buf.subarray(0, off)));
-
-  writeFileSync(out, buf);
-  ora({ text: `Firmware built → ${out}`, color: "green" }).succeed();
 }
 
-/* -------------------------------------------------------------------------
- * Interactive wizard
- * ---------------------------------------------------------------------- */
-async function wizard() {
-  const inquirer: any = (await import("inquirer")).default;
-
-  const { act } = await inquirer.prompt({
-    type: "list",
-    name: "act",
-    message: "Wat wil je doen?",
-    choices: [
-      { name: "Split bestaande firmware", value: "split" },
-      { name: "Build nieuwe firmware", value: "build" },
-    ],
+/* VERIFY */
+function verify(img: string): boolean {
+  const fw = parseFirmware(readFileSync(img));
+  let ok = fw.signatureValid;
+  fw.parts.forEach((p) => {
+    if (!p.crcValid) ok = false;
   });
-
-  if (act === "split") {
-    const { file, prefix } = await inquirer.prompt([
-      {
-        type: "input",
-        name: "file",
-        message: "Pad naar firmware.bin",
-        validate: (p: string) => existsSync(p) || "Bestand bestaat niet",
-      },
-      {
-        type: "input",
-        name: "prefix",
-        message: "Output-prefix (enter voor auto)",
-      },
-    ]);
-    splitFirmware(file, prefix || undefined, true);
-  } else {
-    const { layout, output, ver } = await inquirer.prompt([
-      {
-        type: "input",
-        name: "layout",
-        message: "Descriptor .txt of prefix",
-        validate: (p: string) => existsSync(p) || "Bestand bestaat niet",
-      },
-      {
-        type: "input",
-        name: "output",
-        message: "Uitvoer-bestand",
-        default: "firmware.bin",
-      },
-      { type: "input", name: "ver", message: "FW-versie", default: "UNKNOWN" },
-    ]);
-    buildFirmware(layout, output, ver, true);
-  }
+  console.log(ok ? chalk.green("✔ Constistent") : chalk.red("✗ Fouten"));
+  return ok;
 }
 
-/* -------------------------------------------------------------------------
- * CLI wiring
- * ---------------------------------------------------------------------- */
-const prog = new Command();
-prog.name("ubnt-fwtool").version("0.4.0");
-prog
+/* ---------------- CLI ---------------- */
+const cmd = new Command();
+cmd.name("ubnt-fwtool").version("0.6.3");
+cmd
   .command("split")
-  .argument("<image>")
-  .option("-o, --output <prefix>")
-  .option("-d, --debug")
-  .action((img, opts) => splitFirmware(img, opts.output, !!opts.debug));
-prog
-  .command("build")
-  .argument("<layout|prefix>")
-  .option("-o, --output <file>")
-  .option("-v, --version <str>")
-  .option("-d, --debug")
-  .action((lay, opts) =>
-    buildFirmware(lay, opts.output, opts.version, !!opts.debug)
-  );
-prog.command("wizard").action(wizard);
-
-if (process.argv.length <= 2) wizard().catch((e) => console.error(e));
-else prog.parse(process.argv);
+  .argument("<img>")
+  .option("-o, --output <pref>")
+  .action((i, o) => split(i, o.output));
+cmd.command("list").argument("<img>").action(list);
+cmd
+  .command("verify")
+  .argument("<img>")
+  .action((i) => process.exit(verify(i) ? 0 : 1));
+if (process.argv.length > 2) cmd.parse(process.argv);
+else console.log("gebruik: ubnt-fwtool <cmd>");
