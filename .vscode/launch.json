@@ -1,0 +1,44 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "type": "node",
+        "request": "launch",
+        "name": "Debug unifi-fw-tool (ts-node)",
+        "runtimeExecutable": "npx",
+        "runtimeArgs": ["ts-node/register", "${workspaceRoot}/unifi-fw-tool.ts"],
+        "args": [
+          "split",
+          "US.bcm5334x_6.3.11+14082.220812.0921.bin"                          // <<– pas hier CLI‑arguments aan
+        ],
+        "cwd": "${workspaceRoot}",
+        "autoAttachChildProcesses": true,
+        "skipFiles": ["<node_internals>/**"],
+        "env": {
+          "NODE_OPTIONS": "--enable-source-maps"
+        }
+      },
+      {
+        "type": "node",
+        "request": "launch",
+        "name": "Debug built CLI (dist)",
+        "program": "${workspaceRoot}/dist/unifi-fw-tool.js",
+        "args": [
+          "crc",
+          "fUS.bcm5334x_6.3.11+14082.220812.0921.bin"
+        ],
+        "cwd": "${workspaceRoot}",
+        "preLaunchTask": "npm: build",
+        "outFiles": ["${workspaceRoot}/dist/**/*.js"],
+        "skipFiles": ["<node_internals>/**"]
+      }
+    ],
+    "inputs": [
+      {
+        "id": "cliArgs",
+        "type": "promptString",
+        "description": "Voer CLI‑arguments in (bijv. split firmware.bin)",
+        "default": "-h"
+      }
+    ]
+  }
