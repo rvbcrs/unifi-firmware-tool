@@ -1,3 +1,5 @@
+#!/usr/bin/env -S node --loader ts-node/esm
+
 /*
  * ubnt-fwtool – UniFi firmware utilities (TypeScript)
  * --------------------------------------------------
